@@ -1,6 +1,10 @@
 import math
+import os
 
-from cereal import car, log
+import threading
+import time
+
+from cereal import car, log, messaging
 from common.conversions import Conversions as CV
 from common.numpy_fast import clip, interp
 from common.realtime import DT_MDL
@@ -47,6 +51,25 @@ class VCruiseHelper:
     self.button_timers = {ButtonType.decelCruise: 0, ButtonType.accelCruise: 0}
     self.button_change_states = {btn: {"standstill": False, "enabled": False} for btn in self.button_timers}
 
+    #######################
+    #OVERIDE INITIALIZATION
+    #######################
+
+    self.v_cruise_suggested = 0 # set by _get_suggested_speed
+    self.sm = messaging.SubMaster(['liveLocationKalman', 'carState'])
+
+    # log files
+    self.dirname = os.path.dirname(__file__)
+    self.speed_file = os.path.join(self.dirname, 'data/speed.txt')
+    self.coordinates_file = os.path.join(self.dirname, 'data/coordinates.txt')
+
+    # overwrite previous file
+    with open(self.speed_file, 'w') as sf, open(self.coordinates_file, 'w') as cf:
+      sf.write('')
+      cf.write('')
+
+    threading.Thread(target=self._get_suggested_speed, daemon=True).start()
+
   @property
   def v_cruise_initialized(self):
     return self.v_cruise_kph != V_CRUISE_UNSET
@@ -60,9 +83,11 @@ class VCruiseHelper:
         self._update_v_cruise_non_pcm(CS, enabled, is_metric)
         self.v_cruise_cluster_kph = self.v_cruise_kph
         self.update_button_timers(CS, enabled)
-      else:
-        self.v_cruise_kph = CS.cruiseState.speed * CV.MS_TO_KPH
-        self.v_cruise_cluster_kph = CS.cruiseState.speedCluster * CV.MS_TO_KPH
+      else: # override pcmCruise to see suggested speed, change this to UI only in the future
+        self._update_v_cruise_non_pcm(CS, enabled, is_metric)
+        self.v_cruise_cluster_kph = self.v_cruise_kph
+        # self.v_cruise_kph = CS.cruiseState.speed * CV.MS_TO_KPH
+        # self.v_cruise_cluster_kph = CS.cruiseState.speedCluster * CV.MS_TO_KPH
     else:
       self.v_cruise_kph = V_CRUISE_UNSET
       self.v_cruise_cluster_kph = V_CRUISE_UNSET
@@ -73,47 +98,52 @@ class VCruiseHelper:
     if not enabled:
       return
 
-    long_press = False
-    button_type = None
+    # long_press = False
+    # button_type = None
 
-    v_cruise_delta = 1. if is_metric else IMPERIAL_INCREMENT
+    # v_cruise_delta = 1. if is_metric else IMPERIAL_INCREMENT
 
-    for b in CS.buttonEvents:
-      if b.type.raw in self.button_timers and not b.pressed:
-        if self.button_timers[b.type.raw] > CRUISE_LONG_PRESS:
-          return  # end long press
-        button_type = b.type.raw
-        break
-    else:
-      for k in self.button_timers.keys():
-        if self.button_timers[k] and self.button_timers[k] % CRUISE_LONG_PRESS == 0:
-          button_type = k
-          long_press = True
-          break
+    # for b in CS.buttonEvents:
+    #   if b.type.raw in self.button_timers and not b.pressed:
+    #     if self.button_timers[b.type.raw] > CRUISE_LONG_PRESS:
+    #       return  # end long press
+    #     button_type = b.type.raw
+    #     break
+    # else:
+    #   for k in self.button_timers.keys():
+    #     if self.button_timers[k] and self.button_timers[k] % CRUISE_LONG_PRESS == 0:
+    #       button_type = k
+    #       long_press = True
+    #       break
 
-    if button_type is None:
-      return
+    # if button_type is None:
+    #   return
 
-    # Don't adjust speed when pressing resume to exit standstill
-    cruise_standstill = self.button_change_states[button_type]["standstill"] or CS.cruiseState.standstill
-    if button_type == ButtonType.accelCruise and cruise_standstill:
-      return
+    # # Don't adjust speed when pressing resume to exit standstill
+    # cruise_standstill = self.button_change_states[button_type]["standstill"] or CS.cruiseState.standstill
+    # if button_type == ButtonType.accelCruise and cruise_standstill:
+    #   return
 
-    # Don't adjust speed if we've enabled since the button was depressed (some ports enable on rising edge)
-    if not self.button_change_states[button_type]["enabled"]:
-      return
+    # # Don't adjust speed if we've enabled since the button was depressed (some ports enable on rising edge)
+    # if not self.button_change_states[button_type]["enabled"]:
+    #   return
 
-    v_cruise_delta = v_cruise_delta * (5 if long_press else 1)
-    if long_press and self.v_cruise_kph % v_cruise_delta != 0:  # partial interval
-      self.v_cruise_kph = CRUISE_NEAREST_FUNC[button_type](self.v_cruise_kph / v_cruise_delta) * v_cruise_delta
-    else:
-      self.v_cruise_kph += v_cruise_delta * CRUISE_INTERVAL_SIGN[button_type]
+    # v_cruise_delta = v_cruise_delta * (5 if long_press else 1)
+    # if long_press and self.v_cruise_kph % v_cruise_delta != 0:  # partial interval
+    #   self.v_cruise_kph = CRUISE_NEAREST_FUNC[button_type](self.v_cruise_kph / v_cruise_delta) * v_cruise_delta
+    # else:
+    #   self.v_cruise_kph += v_cruise_delta * CRUISE_INTERVAL_SIGN[button_type]
 
-    # If set is pressed while overriding, clip cruise speed to minimum of vEgo
-    if CS.gasPressed and button_type in (ButtonType.decelCruise, ButtonType.setCruise):
-      self.v_cruise_kph = max(self.v_cruise_kph, CS.vEgo * CV.MS_TO_KPH)
+    # # If set is pressed while overriding, clip cruise speed to minimum of vEgo
+    # if CS.gasPressed and button_type in (ButtonType.decelCruise, ButtonType.setCruise):
+    #   self.v_cruise_kph = max(self.v_cruise_kph, CS.vEgo * CV.MS_TO_KPH)
 
-    self.v_cruise_kph = clip(round(self.v_cruise_kph, 1), V_CRUISE_MIN, V_CRUISE_MAX)
+    # if self.v_cruise_kph < self.v_cruise_suggested:
+    #   self.v_cruise_kph += v_cruise_delta
+    # elif self.v_cruise_kph > self.v_cruise_suggested:
+    #   self.v_cruise_kph -= v_cruise_delta
+
+    self.v_cruise_kph = clip(round(self.v_cruise_suggested, 1), V_CRUISE_MIN, V_CRUISE_MAX)
 
   def update_button_timers(self, CS, enabled):
     # increment timer for buttons still pressed
@@ -142,6 +172,83 @@ class VCruiseHelper:
 
     self.v_cruise_cluster_kph = self.v_cruise_kph
 
+  #################
+  # THREADED CLIENT
+  #################
+
+  # def _get_suggested_speed(self) -> None:
+  #   '''Sends GPS coordinates, receives suggested speed from server every second'''
+  #   # HOST = "128.195.153.42" # the server's IP address (opal PC)
+  #   # HOST = "192.168.153.27" # Eric's PC
+  #   HOST = "172.20.10.6" # laptop IP on Blake's hotspot
+  #   PORT = 65432
+    
+  #   with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as s:
+  #     s.connect((HOST,PORT))
+  #     coordinate_str = '(-1,-1)'      
+      
+  #     while True:
+
+  #       # this caused an error for some reason
+  #       real_location = self.sm['liveLocationKalman']
+  #       try:
+  #         coordinate_str = real_location.positionGeodetic.value[0] + ', ' + real_location.positionGeodetic.value[1]
+  #       except:
+  #         pass
+        
+  #       # carla_location = self.sm['gpsLocationExternal']
+  #       # coordinate_str = str(carla_location.latitude) + ' ,' + str(carla_location.longitude)
+        
+  #       s.sendall(bytes(coordinate_str, encoding='UTF-8'))
+  #       data = s.recv(1024)
+        
+  #       # convert mph to kph
+  #       self.v_cruise_suggested = round(float((data.decode("utf-8")))*CV.MPH_TO_KPH)
+        
+  #       # self.v_cruise_suggested = float(data.decode("utf-8"))
+  #       time.sleep(1)
+
+
+  ##########################
+  # FILE WRITING FOR TESTING
+  ##########################
+
+  def _get_suggested_speed(self) -> None:
+
+    increment = 10
+    
+    while True:
+      self.sm.update()
+      real_location, car_state = self.sm['liveLocationKalman'], self.sm['carState']
+
+      coordinate_str = '(-1,-1)'
+      current_speed = car_state.vEgo * CV.MS_TO_MPH
+      cruise_speed = -1 
+        
+      if real_location.positionGeodetic.valid:
+        coordinate_str = f'({real_location.positionGeodetic.value[0]}, {real_location.positionGeodetic.value[1]})'
+
+      if car_state.cruiseState.available:
+        cruise_speed = car_state.cruiseState.speed * CV.MS_TO_MPH
+
+      suggested_speed = current_speed + increment # MPH
+
+      with open(self.speed_file, 'a') as sf, open(self.coordinates_file, 'a') as cf:
+        # write coordinates
+        cf.write(f'{coordinate_str}\n')
+
+        # get speed from file
+        # self.v_cruise_suggested = round(float(sf.read())*CV.MPH_TO_KPH)
+
+        # write to file: actual, set, suggested
+        sf.write(f'{current_speed}, {cruise_speed}, {suggested_speed}\n')
+      
+      if suggested_speed >= 0:
+        self.v_cruise_suggested = round(suggested_speed*CV.MPH_TO_KPH)
+      
+      increment *= -1
+      
+      time.sleep(20) 
 
 def apply_deadzone(error, deadzone):
   if error > deadzone:
@@ -194,8 +301,7 @@ def get_lag_adjusted_curvature(CP, v_ego, psis, curvatures, curvature_rates):
   return safe_desired_curvature, safe_desired_curvature_rate
 
 
-def get_friction(lateral_accel_error: float, lateral_accel_deadzone: float, friction_threshold: float,
-                 torque_params: car.CarParams.LateralTorqueTuning, friction_compensation: bool) -> float:
+def get_friction(lateral_accel_error: float, lateral_accel_deadzone: float, friction_threshold: float, torque_params: car.CarParams.LateralTorqueTuning, friction_compensation: bool) -> float:
   friction_interp = interp(
     apply_center_deadzone(lateral_accel_error, lateral_accel_deadzone),
     [-friction_threshold, friction_threshold],
